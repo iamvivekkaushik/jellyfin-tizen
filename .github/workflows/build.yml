@@ -107,6 +107,15 @@ jobs:
             printf '%s' "$SAMSUNG_DISTRIBUTOR_P12" | base64 -d > "$cert_dir/distributor.p12"
             export AUTHOR_PASSWORD="$SAMSUNG_AUTHOR_PASSWORD"
             export DISTRIBUTOR_PASSWORD="$SAMSUNG_DISTRIBUTOR_PASSWORD"
+            # Catch a wrong password secret up front (Tizen only says "Invaild password").
+            p12_opens() {
+              openssl pkcs12 -in "$1" -noout -passin env:"$2" 2>/dev/null ||
+                openssl pkcs12 -legacy -in "$1" -noout -passin env:"$2" 2>/dev/null
+            }
+            p12_opens "$cert_dir/author.p12" AUTHOR_PASSWORD ||
+              echo "::error::TIZEN_AUTHOR_PASSWORD does not open TIZEN_AUTHOR_P12"
+            p12_opens "$cert_dir/distributor.p12" DISTRIBUTOR_PASSWORD ||
+              echo "::error::TIZEN_DISTRIBUTOR_PASSWORD does not open TIZEN_DISTRIBUTOR_P12"
             tizen security-profiles add -n ci -a "$cert_dir/author.p12" -p "$AUTHOR_PASSWORD" \
               -d "$cert_dir/distributor.p12" -dp "$DISTRIBUTOR_PASSWORD"
           else
@@ -121,7 +130,25 @@ jobs:
             tizen security-profiles add -n ci -a "$author_p12" -p "$AUTHOR_PASSWORD"
           fi
 
-          # No keyring on the runner, so the CLI prompts for passwords; answer them with expect.
+          # No keyring on the runner: the CLI can't read back the passwords it stored, so write
+          # them into the 'ci' profile directly (file lives only on this ephemeral runner).
+          profiles="$HOME/tizen-studio-data/profile/profiles.xml"
+          python3 -I - "$profiles" <<'EOF'
+          import os, sys, xml.etree.ElementTree as ET
+          path = sys.argv[1]
+          tree = ET.parse(path)
+          pw = {"0": os.environ["AUTHOR_PASSWORD"], "1": os.environ["DISTRIBUTOR_PASSWORD"]}
+          for profile in tree.getroot().iter("profile"):
+              if profile.get("name") != "ci":
+                  continue
+              for item in profile.iter("profileitem"):
+                  if item.get("key") and item.get("distributor") in pw:
+                      item.set("password", pw[item.get("distributor")])
+          tree.write(path, encoding="UTF-8", xml_declaration=True)
+          EOF
+          tizen cli-config "profiles.path=$profiles"
+
+          # Answer any password / save-password prompts the CLI still shows.
           cat > "$RUNNER_TEMP/package.exp" <<'EOF'
           set timeout 600
           spawn tizen package -t wgt -s ci -o $env(OUT_DIR) -- .buildResult
