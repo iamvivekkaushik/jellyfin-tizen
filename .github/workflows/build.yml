@@ -1,0 +1,157 @@
+name: Build WGT
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      web_ref:
+        description: jellyfin-web tag or branch to build (match your server version)
+        required: false
+        default: v12.4
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  WEB_REF: ${{ inputs.web_ref || 'v12.4' }}
+  TIZEN_STUDIO_VERSION: '6.1'
+
+jobs:
+  build:
+    name: Build Jellyfin.wgt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout jellyfin-tizen
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: jellyfin-tizen
+
+      - name: Checkout jellyfin-web
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: jellyfin/jellyfin-web
+          ref: ${{ env.WEB_REF }}
+          path: jellyfin-web
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: jellyfin-web/.nvmrc
+          cache: npm
+          cache-dependency-path: |
+            jellyfin-web/package-lock.json
+            jellyfin-tizen/package-lock.json
+
+      - name: Build jellyfin-web
+        working-directory: jellyfin-web
+        run: |
+          npm ci --no-audit
+          USE_SYSTEM_FONTS=1 npm run build:production
+
+      - name: Prepare www
+        working-directory: jellyfin-tizen
+        env:
+          JELLYFIN_WEB_DIR: ${{ github.workspace }}/jellyfin-web/dist
+        run: |
+          npm ci --no-audit
+          test -f www/index.html
+
+      - name: Install Tizen Studio CLI
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq expect
+          installer="$RUNNER_TEMP/tizen-installer.bin"
+          curl -fsSL --retry 3 -o "$installer" \
+            "https://download.tizen.org/sdk/Installer/tizen-studio_${TIZEN_STUDIO_VERSION}/web-cli_Tizen_Studio_${TIZEN_STUDIO_VERSION}_ubuntu-64.bin"
+          chmod +x "$installer"
+          "$installer" --accept-license "$HOME/tizen-studio"
+          rm -f "$installer"
+          echo "$HOME/tizen-studio/tools/ide/bin" >> "$GITHUB_PATH"
+          echo "$HOME/tizen-studio/tools" >> "$GITHUB_PATH"
+
+      - name: Build WGT
+        working-directory: jellyfin-tizen
+        run: |
+          tizen version
+          tizen build-web -e ".*" -e gulpfile.babel.js -e README.md -e LICENSE -e "*.sh" \
+            -e "node_modules/*" -e "package*.json" -e "yarn.lock"
+          test -d .buildResult
+
+      # Uses your Samsung certificate when the TIZEN_* secrets are set (installable on your TV).
+      # Otherwise signs with a throwaway Tizen certificate so builds still verify (PRs from forks, etc).
+      - name: Sign and package WGT
+        working-directory: jellyfin-tizen
+        env:
+          SAMSUNG_AUTHOR_P12: ${{ secrets.TIZEN_AUTHOR_P12 }}
+          SAMSUNG_AUTHOR_PASSWORD: ${{ secrets.TIZEN_AUTHOR_PASSWORD }}
+          SAMSUNG_DISTRIBUTOR_P12: ${{ secrets.TIZEN_DISTRIBUTOR_P12 }}
+          SAMSUNG_DISTRIBUTOR_PASSWORD: ${{ secrets.TIZEN_DISTRIBUTOR_PASSWORD }}
+        run: |
+          cert_dir="$RUNNER_TEMP/certs"
+          export OUT_DIR="$GITHUB_WORKSPACE/out"
+          mkdir -p "$cert_dir" "$OUT_DIR"
+
+          if [ -n "$SAMSUNG_AUTHOR_P12" ] && [ -n "$SAMSUNG_DISTRIBUTOR_P12" ]; then
+            signed_with=samsung
+            printf '%s' "$SAMSUNG_AUTHOR_P12" | base64 -d > "$cert_dir/author.p12"
+            printf '%s' "$SAMSUNG_DISTRIBUTOR_P12" | base64 -d > "$cert_dir/distributor.p12"
+            export AUTHOR_PASSWORD="$SAMSUNG_AUTHOR_PASSWORD"
+            export DISTRIBUTOR_PASSWORD="$SAMSUNG_DISTRIBUTOR_PASSWORD"
+            tizen security-profiles add -n ci -a "$cert_dir/author.p12" -p "$AUTHOR_PASSWORD" \
+              -d "$cert_dir/distributor.p12" -dp "$DISTRIBUTOR_PASSWORD"
+          else
+            signed_with=tizen
+            echo "::notice::TIZEN_* secrets not set; signing with a throwaway Tizen certificate (not installable on retail TVs)."
+            export AUTHOR_PASSWORD="$(openssl rand -hex 16)"
+            echo "::add-mask::$AUTHOR_PASSWORD"
+            export DISTRIBUTOR_PASSWORD=tizenpkcs12passfordsigner  # Tizen SDK's public default distributor
+            tizen certificate -a ci -p "$AUTHOR_PASSWORD" -n "Jellyfin CI" -f ci-author
+            author_p12="$(find "$HOME" -name ci-author.p12 -print -quit)"
+            test -n "$author_p12"
+            tizen security-profiles add -n ci -a "$author_p12" -p "$AUTHOR_PASSWORD"
+          fi
+
+          # No keyring on the runner, so the CLI prompts for passwords; answer them with expect.
+          cat > "$RUNNER_TEMP/package.exp" <<'EOF'
+          set timeout 600
+          spawn tizen package -t wgt -s ci -o $env(OUT_DIR) -- .buildResult
+          expect {
+            "Author password:" { send -- "$env(AUTHOR_PASSWORD)\r"; exp_continue }
+            -re {Distributor[0-9] password:} { send -- "$env(DISTRIBUTOR_PASSWORD)\r"; exp_continue }
+            -ex "(Y), No: (N)" { send -- "N\r"; exp_continue }
+            timeout { puts "tizen package timed out"; exit 1 }
+            eof
+          }
+          catch wait result
+          exit [lindex $result 3]
+          EOF
+          expect -f "$RUNNER_TEMP/package.exp"
+
+          wgt="$(ls "$OUT_DIR"/*.wgt)"
+          echo "SIGNED_WITH=$signed_with" >> "$GITHUB_ENV"
+          {
+            echo "### Jellyfin.wgt"
+            echo "- jellyfin-web: \`$WEB_REF\`"
+            echo "- Signed with: **$signed_with** certificate"
+            echo "- Size: $(du -h "$wgt" | cut -f1)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload WGT
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Jellyfin-${{ env.WEB_REF }}-${{ env.SIGNED_WITH }}
+          path: out/*.wgt
+          if-no-files-found: error
+
+      - name: Print Tizen CLI log
+        if: failure()
+        run: cat "$HOME/tizen-studio-data/cli/logs/cli.log" 2>/dev/null || true
