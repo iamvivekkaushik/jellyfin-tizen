@@ -21,7 +21,8 @@ permissions:
 
 env:
   WEB_REF: ${{ inputs.web_ref || 'v12.4' }}
-  TIZEN_STUDIO_VERSION: '6.1'
+  # 6.x Linux web-cli is missing eclipse runtime jars (build-web throws NoClassDefFoundError).
+  TIZEN_STUDIO_VERSION: '4.5.1'
 
 jobs:
   build:
